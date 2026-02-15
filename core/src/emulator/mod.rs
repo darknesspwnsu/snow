@@ -784,6 +784,15 @@ impl Emulator {
         );
         Ok(())
     }
+
+    #[cfg(feature = "savestates")]
+    pub fn save_state_to_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+        screenshot: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.save_state(path.as_ref(), screenshot)
+    }
 }
 
 impl Tickable for Emulator {

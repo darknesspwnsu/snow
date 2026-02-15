@@ -2,6 +2,65 @@
 // Should only be used in the js_api module, and exposed as safe Rust functions
 // outside of it.
 
+const SNAPSHOT_NONE = 0;
+const SNAPSHOT_SAVE = 1;
+const SNAPSHOT_LOAD = 2;
+
+const snapshotPathForSave = requestId =>
+    `/tmp/outgoing-vm-snapshot-${requestId}.snows`;
+const snapshotPathForLoad = requestId =>
+    `/tmp/incoming-vm-snapshot-${requestId}.snows`;
+
+const snapshotMailbox = {
+    queue: [],
+    active: null,
+    enqueue(command) {
+        this.queue.push(command);
+    },
+    ensureActive() {
+        if (!this.active && this.queue.length > 0) {
+            this.active = this.queue.shift();
+        }
+    },
+    peekKind() {
+        this.ensureActive();
+        return this.active?.kind ?? SNAPSHOT_NONE;
+    },
+    consumeRequestId() {
+        this.ensureActive();
+        if (!this.active) {
+            return 0;
+        }
+        const requestId = this.active.requestId;
+        this.active = null;
+        return requestId;
+    },
+};
+
+globalThis.__snowRequestVMSnapshotSave = requestId => {
+    snapshotMailbox.enqueue({
+        kind: SNAPSHOT_SAVE,
+        requestId,
+    });
+};
+
+globalThis.__snowRequestVMSnapshotLoad = (requestId, data) => {
+    if (!globalThis.FS) {
+        throw new Error("Emscripten FS is unavailable.");
+    }
+    try {
+        FS.mkdir("/tmp");
+    } catch (_) {
+        // directory already exists
+    }
+    const path = snapshotPathForLoad(requestId);
+    FS.writeFile(path, data);
+    snapshotMailbox.enqueue({
+        kind: SNAPSHOT_LOAD,
+        requestId,
+    });
+};
+
 mergeInto(LibraryManager.library, {
     // Runtime
     js_sleep(seconds) {
@@ -9,6 +68,58 @@ mergeInto(LibraryManager.library, {
     },
     js_check_for_periodic_tasks() {
         workerApi.checkForPeriodicTasks();
+    },
+    js_snapshot_take_kind() {
+        return snapshotMailbox.peekKind();
+    },
+    js_snapshot_take_request_id() {
+        return snapshotMailbox.consumeRequestId();
+    },
+    js_snapshot_complete_save(requestId) {
+        const path = snapshotPathForSave(requestId);
+        let data;
+        try {
+            data = FS.readFile(path);
+        } catch (err) {
+            postMessage({
+                type: "emulator_vm_snapshot_error",
+                requestId,
+                error: String(err),
+            });
+            return;
+        }
+        postMessage(
+            {
+                type: "emulator_vm_snapshot_saved",
+                requestId,
+                data,
+            },
+            [data.buffer]
+        );
+        try {
+            FS.unlink(path);
+        } catch (_) {
+            // noop
+        }
+    },
+    js_snapshot_complete_loaded(requestId) {
+        const path = snapshotPathForLoad(requestId);
+        postMessage({
+            type: "emulator_vm_snapshot_loaded",
+            requestId,
+        });
+        try {
+            FS.unlink(path);
+        } catch (_) {
+            // noop
+        }
+    },
+    js_snapshot_complete_error(requestId, errorPtr) {
+        postMessage({
+            type: "emulator_vm_snapshot_error",
+            requestId,
+            error: UTF8ToString(errorPtr),
+        });
     },
 
     // Video

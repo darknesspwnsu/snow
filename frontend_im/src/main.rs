@@ -4,6 +4,7 @@ use snow_core::emulator::comm::{EmulatorCommand, EmulatorEvent, EmulatorStatus};
 use snow_core::emulator::{Emulator, MouseMode};
 use snow_core::mac::{ExtraROMs, MacModel, MacMonitor};
 use snow_core::tickable::Tickable;
+use std::path::{Path, PathBuf};
 
 use crate::cdrom::CdromManager;
 
@@ -111,7 +112,7 @@ fn main() {
     log::info!("Initialized {} SCSI devices", next_scsi_id);
 
     let cmd_sender = emulator.create_cmd_sender();
-    let event_recv = emulator.create_event_recv();
+    let mut event_recv = emulator.create_event_recv();
     let mut floppy_drive = 0usize;
     for floppy_name in floppy_names {
         if floppy_drive >= 3 {
@@ -138,11 +139,72 @@ fn main() {
     cmd_sender.send(EmulatorCommand::Run).unwrap();
 
     let mut framebuffer_sender = framebuffer::Sender::new(frame_receiver);
-    let input_receiver = input::Receiver::new(cmd_sender, mouse_mode);
+    let mut input_receiver = input::Receiver::new(cmd_sender.clone(), mouse_mode);
     let mut last_status: Option<Box<EmulatorStatus>> = None;
     loop {
         js_api::runtime::check_for_periodic_tasks();
         input_receiver.tick();
+
+        if let Some(snapshot_command) = js_api::control::take_snapshot_command() {
+            match snapshot_command.kind {
+                js_api::control::SnapshotCommandKind::Save => {
+                    let snapshot_path = snapshot_save_path(snapshot_command.request_id);
+                    match emulator.save_state_to_path(&snapshot_path, None) {
+                        Ok(()) => {
+                            js_api::control::complete_snapshot_save(
+                                snapshot_command.request_id,
+                            );
+                        }
+                        Err(err) => {
+                            js_api::control::complete_snapshot_error(
+                                snapshot_command.request_id,
+                                &format!("VM snapshot save failed: {}", err),
+                            );
+                        }
+                    }
+                }
+                js_api::control::SnapshotCommandKind::Load => {
+                    let snapshot_path = snapshot_load_path(snapshot_command.request_id);
+                    match Emulator::load_state(&snapshot_path, Path::new("/tmp")) {
+                        Ok((mut loaded_emulator, frame_recv)) => {
+                            loaded_emulator
+                                .set_audio_sink(Box::new(audio::JsAudioSink::new()));
+                            let loaded_cmd_sender = loaded_emulator.create_cmd_sender();
+                            let loaded_event_recv = loaded_emulator.create_event_recv();
+                            if let Err(err) =
+                                loaded_cmd_sender.send(EmulatorCommand::Run)
+                            {
+                                js_api::control::complete_snapshot_error(
+                                    snapshot_command.request_id,
+                                    &format!(
+                                        "VM snapshot load run command failed: {}",
+                                        err
+                                    ),
+                                );
+                                continue;
+                            }
+
+                            emulator = loaded_emulator;
+                            event_recv = loaded_event_recv;
+                            framebuffer_sender = framebuffer::Sender::new(frame_recv);
+                            input_receiver =
+                                input::Receiver::new(loaded_cmd_sender, mouse_mode);
+                            last_status = None;
+
+                            js_api::control::complete_snapshot_loaded(
+                                snapshot_command.request_id,
+                            );
+                        }
+                        Err(err) => {
+                            js_api::control::complete_snapshot_error(
+                                snapshot_command.request_id,
+                                &format!("VM snapshot load failed: {}", err),
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         while let Ok(event) = event_recv.try_recv() {
             match event {
@@ -184,4 +246,18 @@ fn model_from_gestalt(gestalt_id: u32) -> Option<MacModel> {
         .iter()
         .find(|(id, _)| *id == gestalt_id)
         .map(|(_, model)| *model)
+}
+
+fn snapshot_save_path(request_id: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/outgoing-vm-snapshot-{}.snows",
+        request_id
+    ))
+}
+
+fn snapshot_load_path(request_id: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/incoming-vm-snapshot-{}.snows",
+        request_id
+    ))
 }
